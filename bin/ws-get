@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+
+VERSION="v0.4.0"
+
+thisName="ws-get"
+
+wsDir=${WS_PREFIX:-$HOME/ws}
+wsBinDir=${wsDir}/bin
+wsExe="${wsBinDir}/ws"
+wsRepoDir=${wsDir}/.repo
+wsRepoUrl='https://github.com/continuul/ws'
+
+WS_PREFIX=${wsDir}
+
+# Parse options.
+noColor=0 skipPrompts=0 testPrerequisitesOnly=0 skipInitFileUpdate=0 quiet=0
+
+function EchoColored () {
+  local pre="\033[${1}m" post='\033[0m'
+  (( noColor )) && { pre= post=; }
+  shift # skip the color argument
+  if (( $# )); then
+    printf "${pre}%s${post}\n" "$*"
+  else
+    [[ -t 0 ]] && { printf '\n'; return; } # no interactive stdin input
+    printf "$pre"; cat; printf "$post"
+  fi
+}
+
+Green()  { EchoColored 32 "$@"; }
+Red()    { EchoColored 31 "$@"; }
+Blue()   { EchoColored 34 "$@"; }
+Yellow() { EchoColored 33 "$@"; }
+
+function Die () {
+  local preamble="$thisName: ERROR:"
+  if [[ $1 == '-' ]]; then # from stdin
+    {
+      printf '%s\n' "$preamble"
+      sed 's/^/  &/'
+    } | EchoColored 31 # red
+  else # from operands
+    EchoColored 31 "$preamble ${1:-"ABORTING due to unexpected error."}"
+  fi
+  exit ${2:-1}
+} >&2
+
+function DieSyntax () {
+  local diePreamble="${thisName}: ARGUMENT ERROR:"
+  if [[ $1 == '-' ]]; then # from stdin
+    {
+      printf '%s\n' "${diePreamble}"
+      sed 's/^/  &/'
+    } | EchoColored 31 # red
+  else # from operands
+    EchoColored 31 "${diePreamble} ${1:-"Invalid argument(s) specified."} Use -h for help."
+  fi
+  exit 2
+} >&2
+
+function Echo-Options () {
+  echo "noColor: ${noColor}"
+  echo "quiet: ${quiet}"
+  echo "skipPrompts: ${skipPrompts}"
+  echo "skipInitFileUpdate: ${skipInitFileUpdate}"
+  echo "testPrerequisitesOnly: ${testPrerequisitesOnly}"
+}
+
+function Install () {
+  if (( ! (skipPrompts || quiet) )); then
+    cat <<EOF
+===
+You are ABOUT TO INSTALL ws, the Developer Workspace manager, in:
+  $(Green $WS_PREFIX)
+If your shell is Bash, Ksh, or Zsh, the relevant initialization file will be
+modified in order to:
+ - export environment variable \$WS_PREFIX.
+ - ensure that \$WS_PREFIX/bin is in the \$PATH
+For any other shell you'll have to make these modifications yourself (details
+to follow).
+For more information, see $wsRepoUrl
+===
+EOF
+    # Determine where to read user input from:
+    #   If -f ${BASH_SOURCE} is true, we're running from a local script file, such as during testing, so we respect whatever stdin is set to, so that user input can be *simulated*.
+    #   Otherwise, the assumption is that we're running via curl ... | bash, in which case we always want to read from /dev/tty - giving us a chance to
+    #   to pipe the script contents via stdin, while soliciting user input from the terminal (unless -y was specified to skipt he confirmation prompt).
+    [[ -f ${BASH_SOURCE} ]] && src='/dev/stdin' || src='/dev/tty'
+    # Prompt the user:
+    while :; do
+      read -ep "CONTINUE (y/N)? " promptInput < "$src" || exit # `read` fails only if stdin does NOT come from a terminal
+      [[ $promptInput =~ ^[nN]$ || -z $promptInput ]] && { echo "Aborted." >&2; exit 3; }
+      [[ $promptInput != [yY] ]] && { echo "Invalid input; please try again." 1>&2; continue; }
+      break
+    done
+  fi
+  mkdir -p "${wsDir}" || Die "Failed to create directory '${wsDir}'."
+  preReqMsg=
+  for exe in curl git; do
+    [[ -n $(command -v "${exe}") ]] || preReqMsg+="${preReqMsg:+$'\n'}\`${exe}\` not found, which is required for operation."
+  done
+  for makeExe in make gmake; do
+    "${makeExe}" --version 2>/dev/null | grep -Fq "GNU Make" && break
+    [[ ${makeExe} == 'make' ]] && continue # if 'make' isn't GNU Make, try again with 'gmake'.
+    preReqMsg+="${preReqMsg:+$'\n'}GNU Make not found, which is required for operation."$'\n'"On FreeBSD and PC-BSD, for instance, you can download it with \`sudo pkg install gmake\`."
+  done
+  (( quiet )) || echo "-- Cloning wsRepoUrl to '${wsRepoDir}'..."
+  git clone --depth 1 --no-checkout --quiet "${wsRepoUrl}" "${wsRepoDir}/" >/dev/null || Die "Aborting, because cloning ws's GitHub repository into '${wsRepoDir}' failed."
+  (cd "${wsRepoDir}" && git config core.autocrlf input && git checkout --quiet && WS_PREFIX="${wsDir}" "${makeExe}" install >/dev/null) || Die "Aborting, because ws's own installation procedure failed."
+  (( quiet )) || echo "-- Running local ws installation to '${wsBinDir}'..."
+  (( quiet )) || cat <<EOF
+=== ws successfully installed.
+EOF
+} >&2
+
+function Update () {
+  for makeExe in make gmake; do
+    "$makeExe" --version 2>/dev/null | grep -Fq "GNU Make" && break
+    [[ $makeExe == 'make' ]] && continue # if 'make' isn't GNU Make, try again with 'gmake'.
+    preReqMsg+="${preReqMsg:+$'\n'}GNU Make not found, which is required for operation."$'\n'"On FreeBSD and PC-BSD, for instance, you can download it with \`sudo pkg install gmake\`."
+  done
+  [[ -z $preReqMsg ]] || Die - <<<"$preReqMsg"
+  [[ -d ${wsRepoDir}/.git ]] || Die "ws repository not found in '${wsDir}'."
+  if (( ! skipPrompts )); then
+    while :; do
+      read -p "Check for updates to ws (version $("${wsExe}" --version), installed in '${wsDir}')? (y/N) " promptInput
+      [[ $promptInput =~ ^[yY]$ ]] && break # OK
+      [[ $promptInput =~ ^[nN]$ || -z $promptInput ]] && { echo "Aborted." 1>&2; exit 3; }
+      echo "Invalid input; please try again (^C to abort)." 1>&2
+    done
+  fi
+  cd "${wsRepoDir}" || Die
+  echo "-- Checking for updates..."
+  git fetch --depth 1 --quiet && git config core.autocrlf input && git reset --hard --quiet origin/master || Die
+  diff "${wsRepoDir}/bin/ws" "${wsExe}" >/dev/null && { echo "(Installed version $("${wsExe}" --version) is up-to-date.)"; exit 0; }
+  WS_PREFIX="$WS_PREFIX" "$makeExe" install >/dev/null || Die
+  echo "-- ws successfully updated to version $("$wsExe" --version)."
+} >&2
+
+function Remove () {
+  if (( ! skipPrompts )); then
+    cat <<EOF
+====
+You are ABOUT TO UNINSTALL ws, the workspace manager,
+which includes REMOVAL of the following directory:
+  $(Yellow "${wsRepoDir}")
+For more information, see ${wsRepoUrl}
+====
+EOF
+    # Determine where to read user input from:
+    #   If -f ${BASH_SOURCE} is true, we're running from a local script file, such as during testing, so we respect whatever stdin is set to, so that user input can be *simulated*.
+    #   Otherwise, the assumption is that we're running via curl ... | bash, in which case we always want to read from /dev/tty - giving us a chance to
+    #   to pipe the script contents via stdin, while soliciting user input from the terminal (unless -y was specified to skipt he confirmation prompt).
+    [[ -f ${BASH_SOURCE} ]] && src='/dev/stdin' || src='/dev/tty'
+    # Prompt the user:
+    while :; do
+      read -ep "CONTINUE (y/N)? " promptInput < "$src" || exit # `read` fails only if stdin does NOT come from a terminal
+      [[ $promptInput =~ ^[nN]$ || -z $promptInput ]] && { echo "Aborted." >&2; exit 3; }
+      [[ $promptInput != [yY] ]] && { echo "Invalid input; please try again." 1>&2; continue; }
+      break
+    done
+  fi
+  rm -f "${wsExe}"
+  rm -fr "${wsRepoDir}"
+  echo "-- ws successfully uninstalled from '${wsRepoDir}'."
+} >&2
+
+#
+# Output version.
+#
+
+function Show-Version () {
+  echo "$VERSION" && exit 0
+}
+
+function Parse-Options () {
+  local OPTIND
+  while getopts ':qvy-:' opt; do
+    [[ $opt == '?' ]] && DieSyntax "Unknown option: -$OPTARG"
+    [[ $opt == ':' ]] && DieSyntax "Option -$OPTARG is missing its argument."
+    case "$opt" in
+      q)
+        quiet=1
+        ;;
+      v | version)
+        Show-Version
+        ;;
+      y)
+        skipPrompts=1
+        ;;
+      *)
+        Die "OPTARG option -$opt not handled."
+        ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  subCommand=$1; shift
+  case "${subCommand}" in
+    i | install)
+      while getopts ':ytnq' opt; do
+        [[ $opt == '?' ]] && DieSyntax "Unknown option: -$OPTARG"
+        [[ $opt == ':' ]] && DieSyntax "Option -$OPTARG is missing its argument."
+        case "$opt" in
+          q)
+            quiet=1
+            ;;
+          y)
+            skipPrompts=1
+            ;;
+          *)
+            Die "OPTARG option -$opt not handled."
+            ;;
+        esac
+      done
+      shift $((OPTIND - 1))
+      Install
+      ;;
+    u | update)
+      while getopts ':ytnq' opt; do
+        [[ $opt == '?' ]] && DieSyntax "Unknown option: -$OPTARG"
+        [[ $opt == ':' ]] && DieSyntax "Option -$OPTARG is missing its argument."
+        case "$opt" in
+          q)
+            quiet=1
+            ;;
+          y)
+            skipPrompts=1
+            ;;
+          *)
+            Die "OPTARG option -$opt not handled."
+            ;;
+        esac
+      done
+      shift $((OPTIND - 1))
+      Update
+      ;;
+    r | remove | uninstall)
+      while getopts ':ytnq' opt; do
+        [[ $opt == '?' ]] && DieSyntax "Unknown option: -$OPTARG"
+        [[ $opt == ':' ]] && DieSyntax "Option -$OPTARG is missing its argument."
+        case "$opt" in
+          q)
+            quiet=1
+            ;;
+          y)
+            skipPrompts=1
+            ;;
+          *)
+            Die "OPTARG option -$opt not handled."
+            ;;
+        esac
+      done
+      shift $((OPTIND - 1))
+      Remove
+      ;;
+    esac
+}
+
+Parse-Options "$@"
